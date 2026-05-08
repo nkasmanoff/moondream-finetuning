@@ -1,0 +1,10 @@
+wandb
+einops
+pyvips-binary==8.16.0
+pyvips==2.2.3
+transformers==4.51.3
+torch==2.7.1
+pandas
+torchvision==0.22.1
+peft==0.15.2
+rich==14.0.0

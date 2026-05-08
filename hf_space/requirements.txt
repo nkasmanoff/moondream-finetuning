@@ -1,0 +1,11 @@
+einops
+transformers>=4.51
+torch>=2.7
+torchvision>=0.22
+safetensors
+huggingface_hub
+gradio>=4.0
+spaces
+tokenizers
+Pillow
+requests

@@ -1,7 +1,25 @@
-**.safetensors
-**__pycache__**
-**wandb**
-**predictions/
-**model_artifacts/
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Local training/evaluation outputs
+*.safetensors
+wandb/
+wandb_export_*.csv
+predictions/
+model_artifacts/
 datasets/basketball-player-detection-3.v1i.coco/
-**.DS_Store
+
+# Notebook/runtime clutter
+.ipynb_checkpoints/
+.DS_Store
+
+# Local scratch files
+Test Inference.ipynb
+image*.png
+photo.jpg

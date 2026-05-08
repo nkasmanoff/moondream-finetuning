@@ -29,6 +29,7 @@ Training with overfitting mode:
 import logging
 import os
 import random
+from collections import defaultdict
 from typing import List, Optional, Union
 
 import torch
@@ -78,6 +79,40 @@ def train_val_test_split(
         KartSceneDataset(val_samples),
         KartSceneDataset(test_samples),
     )
+
+
+def _macro_precision_recall(preds: list, gts: list) -> dict:
+    """Compute macro-averaged precision, recall, and per-class breakdown."""
+    labels = sorted(set(gts) | set(preds))
+    tp = defaultdict(int)
+    fp = defaultdict(int)
+    fn = defaultdict(int)
+
+    for p, g in zip(preds, gts):
+        if p == g:
+            tp[g] += 1
+        else:
+            fp[p] += 1
+            fn[g] += 1
+
+    per_class = {}
+    for label in labels:
+        p_denom = tp[label] + fp[label]
+        r_denom = tp[label] + fn[label]
+        per_class[label] = {
+            "precision": tp[label] / p_denom if p_denom > 0 else 0.0,
+            "recall": tp[label] / r_denom if r_denom > 0 else 0.0,
+            "support": tp[label] + fn[label],
+        }
+
+    macro_prec = sum(v["precision"] for v in per_class.values()) / len(per_class) if per_class else 0.0
+    macro_rec = sum(v["recall"] for v in per_class.values()) / len(per_class) if per_class else 0.0
+
+    return {
+        "precision": macro_prec,
+        "recall": macro_rec,
+        "per_class": per_class,
+    }
 
 
 def teacher_forced_text_loss(
@@ -136,23 +171,31 @@ def teacher_forced_text_loss(
     return loss
 
 
-def validate_text(model, val_ds, step, max_samples=250):
+def validate_text(
+    model,
+    val_ds,
+    step,
+    max_samples=250,
+    log_predictions=False,
+    prediction_table_size=32,
+):
     """
     Validate by generating answers with model.query() and computing
-    exact-match accuracy against ground truth.
+    exact-match accuracy, macro precision, and macro recall.
 
-    Args:
-        model: MoondreamModel to evaluate.
-        val_ds: Validation dataset returning dicts with "image", "question", "answer".
-        step: Current training step (for logging).
-        max_samples: Maximum number of samples to evaluate.
+    When log_predictions=True, also builds a wandb.Table of sample
+    predictions (with images) for qualitative inspection.
 
     Returns:
-        Dict with "accuracy", "correct", "total".
+        Dict with "accuracy", "precision", "recall", "correct", "total",
+        and optionally "prediction_table" (a wandb.Table).
     """
     model.eval()
     correct = 0
     total = 0
+    all_preds: list[str] = []
+    all_gts: list[str] = []
+    prediction_rows: list[list] = []
     num_samples = min(max_samples, len(val_ds))
 
     with torch.no_grad():
@@ -167,16 +210,46 @@ def validate_text(model, val_ds, step, max_samples=250):
             predicted = result["answer"].strip().lower()
             gt = sample["answer"].strip().lower()
 
+            all_preds.append(predicted)
+            all_gts.append(gt)
+
             if predicted == gt:
                 correct += 1
             total += 1
+
+            if log_predictions and len(prediction_rows) < prediction_table_size:
+                prediction_rows.append([
+                    wandb.Image(sample["image"]),
+                    sample.get("task", ""),
+                    sample["question"],
+                    gt,
+                    predicted,
+                    predicted == gt,
+                ])
 
     model.train()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     accuracy = correct / total if total > 0 else 0.0
-    return {"accuracy": accuracy, "correct": correct, "total": total}
+    pr = _macro_precision_recall(all_preds, all_gts)
+
+    out = {
+        "accuracy": accuracy,
+        "precision": pr["precision"],
+        "recall": pr["recall"],
+        "per_class": pr["per_class"],
+        "correct": correct,
+        "total": total,
+    }
+
+    if log_predictions and prediction_rows:
+        out["prediction_table"] = wandb.Table(
+            columns=["image", "task", "question", "ground_truth", "prediction", "correct"],
+            data=prediction_rows,
+        )
+
+    return out
 
 
 def main(
@@ -340,23 +413,31 @@ def main(
 
     # Initial validation
     initial_val = validate_text(
-        model, val_dataset, step=0, max_samples=validation_samples
+        model, val_dataset, step=0, max_samples=validation_samples,
+        log_predictions=True,
     )
     best_val_accuracy = initial_val["accuracy"]
     best_validation_step = 0
-    logging.info(f"Initial validation accuracy: {best_val_accuracy:.4f}")
+    logging.info(
+        f"Initial validation — acc: {best_val_accuracy:.4f}  "
+        f"prec: {initial_val['precision']:.4f}  rec: {initial_val['recall']:.4f}"
+    )
 
     initial_test = validate_text(
-        model, test_dataset, step=0, max_samples=validation_samples
+        model, test_dataset, step=0, max_samples=validation_samples,
     )
 
-    wandb.log(
-        {
-            "initial_val_accuracy": initial_val["accuracy"],
-            "initial_test_accuracy": initial_test["accuracy"],
-        },
-        step=0,
-    )
+    init_log = {
+        "initial_val_accuracy": initial_val["accuracy"],
+        "initial_val_precision": initial_val["precision"],
+        "initial_val_recall": initial_val["recall"],
+        "initial_test_accuracy": initial_test["accuracy"],
+        "initial_test_precision": initial_test["precision"],
+        "initial_test_recall": initial_test["recall"],
+    }
+    if "prediction_table" in initial_val:
+        init_log["val_predictions_step0"] = initial_val["prediction_table"]
+    wandb.log(init_log, step=0)
 
     total_steps = epochs * len(dataset) // grad_accum_steps
     pbar = tqdm(total=total_steps)
@@ -403,15 +484,22 @@ def main(
                         val_dataset,
                         step=current_step,
                         max_samples=validation_samples,
+                        log_predictions=True,
                     )
                     logging.info(
-                        f"Validation accuracy: {val_score['accuracy']:.4f}"
+                        f"Val — acc: {val_score['accuracy']:.4f}  "
+                        f"prec: {val_score['precision']:.4f}  "
+                        f"rec: {val_score['recall']:.4f}"
                     )
 
-                    wandb.log(
-                        {"val_accuracy": val_score["accuracy"]},
-                        step=current_step,
-                    )
+                    val_log = {
+                        "val_accuracy": val_score["accuracy"],
+                        "val_precision": val_score["precision"],
+                        "val_recall": val_score["recall"],
+                    }
+                    if "prediction_table" in val_score:
+                        val_log[f"val_predictions_step{current_step}"] = val_score["prediction_table"]
+                    wandb.log(val_log, step=current_step)
 
                     if val_score["accuracy"] > best_val_accuracy:
                         best_val_accuracy = val_score["accuracy"]
@@ -465,20 +553,29 @@ def main(
         test_dataset,
         step=best_validation_step,
         max_samples=validation_samples,
+        log_predictions=True,
+        prediction_table_size=64,
     )
     logging.info(
-        f"Test accuracy (best model from step {best_validation_step}): "
-        f"{test_score['accuracy']:.4f}"
+        f"Test (best model, step {best_validation_step}) — "
+        f"acc: {test_score['accuracy']:.4f}  "
+        f"prec: {test_score['precision']:.4f}  "
+        f"rec: {test_score['recall']:.4f}"
     )
 
     final_step = best_validation_step + 1
-    wandb.log(
-        {"test/accuracy": test_score["accuracy"]},
-        step=final_step,
-        commit=True,
-    )
+    test_log = {
+        "test/accuracy": test_score["accuracy"],
+        "test/precision": test_score["precision"],
+        "test/recall": test_score["recall"],
+    }
+    if "prediction_table" in test_score:
+        test_log["test_predictions"] = test_score["prediction_table"]
+    wandb.log(test_log, step=final_step, commit=True)
 
     wandb.run.summary["test/accuracy"] = test_score["accuracy"]
+    wandb.run.summary["test/precision"] = test_score["precision"]
+    wandb.run.summary["test/recall"] = test_score["recall"]
     wandb.run.summary["best_validation_step"] = best_validation_step
 
     wandb.finish()
