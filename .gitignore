@@ -13,7 +13,7 @@ wandb/
 wandb_export_*.csv
 predictions/
 model_artifacts/
-datasets/basketball-player-detection-3.v1i.coco/
+_datasets/basketball-player-detection-3.v1i.coco/
 
 # Notebook/runtime clutter
 .ipynb_checkpoints/
