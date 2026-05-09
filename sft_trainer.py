@@ -32,7 +32,12 @@ Training with overfitting mode:
 
 import logging
 import os
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import torch
 import torch.nn.functional as F

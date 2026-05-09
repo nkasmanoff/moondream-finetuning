@@ -34,7 +34,12 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 import fire
 import matplotlib.pyplot as plt
