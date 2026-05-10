@@ -148,6 +148,7 @@ def _run_query_encoder(model: MoondreamModel, image) -> torch.Tensor:
 def _query_emb_pooled(model: MoondreamModel, query_image) -> torch.Tensor:
     """Mean-pool the query's projected patch tokens to a (1, 1, D) prompt slot."""
     tokens = _run_query_encoder(model, query_image)        # (729, D)
+    # TODO: eventually try other methods of combining.
     pooled = tokens.mean(dim=0, keepdim=True).unsqueeze(0)  # (1, 1, D)
     return pooled
 
@@ -180,13 +181,13 @@ def teacher_forced_visual_prompt_loss(
     prefix_ids = detect_template["prefix"]
     suffix_ids = detect_template["suffix"]
 
-    # Target image is frozen — same as in sft_trainer.py.
+    # Target image is frozen — same as usual.
     with torch.no_grad():
         encoded_target = encode_image_grad(model, target_image, settings=None)
     model.load_encoded_image(encoded_target)
     pos = encoded_target.pos
 
-    # Build the spliced prompt embedding: [prefix_text, query_pooled, suffix_text].
+    # Build the new visual-prompt embedding: [prefix_text, query_pooled, suffix_text].
     pre = text_encoder(
         torch.tensor([prefix_ids], device=model.device, dtype=torch.long), model.text
     )
@@ -373,13 +374,16 @@ def validate_visual_prompt(
     iou_threshold: float = 0.5,
     max_plot_samples: int = 16,
     log_to_wandb: bool = True,
+    predictions_dir: str = "predictions",
 ) -> dict:
     """F1 / precision / recall against GT, using detect_with_visual_prompt.
 
-    Also saves up to ``max_plot_samples`` side-by-side prediction figures and
-    logs them to wandb under the ``predictions/vp`` key (when ``log_to_wandb``).
+    Also saves up to ``max_plot_samples`` side-by-side prediction figures into
+    ``predictions_dir`` and logs them to wandb under ``predictions/vp`` (when
+    ``log_to_wandb``).
     """
     model.eval()
+    os.makedirs(predictions_dir, exist_ok=True)
     n = min(max_samples, len(val_ds))
     TP = FP = FN = 0
     images: list = []
@@ -399,7 +403,9 @@ def validate_visual_prompt(
                         sample["query_crop"], sample["target_image"],
                         gt_dicts, preds, sample["class_name"], tp, fp, fn,
                     )
-                    fig_path = f"predictions/vp_step{step}_{i:03d}.png"
+                    fig_path = os.path.join(
+                        predictions_dir, f"vp_step{step}_{i:03d}.png"
+                    )
                     fig.savefig(fig_path, dpi=90, bbox_inches="tight")
                     plt.close(fig)
                     if log_to_wandb:
@@ -434,6 +440,7 @@ def main(
     grad_accum_steps: int = 64,
     validation_samples: int = 250,
     eval_interval: int = 5,
+    early_stopping_patience: int = 10,
     val_plot_samples: int = 16,
     overfit_batch_size: Optional[int] = None,
     lora_rank: int = 32,
@@ -455,6 +462,9 @@ def main(
     # IO
     model_path: str = "moondream2/model.safetensors",
     wandb_project: str = "moondream-visual-prompt-ft",
+    run_name: Optional[str] = None,
+    artifact_dir: str = "model_artifacts",
+    predictions_dir: str = "predictions",
 ):
     """Train Moondream 2 with visual prompts via LoRA on text decoder + proj_mlp."""
     if text_lora_targets is None:
@@ -469,14 +479,18 @@ def main(
     for noisy in ("httpx", "httpcore", "urllib3", "fiftyone"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    os.makedirs("predictions", exist_ok=True)
-    os.makedirs("model_artifacts", exist_ok=True)
+    os.makedirs(predictions_dir, exist_ok=True)
+    os.makedirs(artifact_dir, exist_ok=True)
+    logging.info(f"Artifact dir:    {artifact_dir}")
+    logging.info(f"Predictions dir: {predictions_dir}")
 
     wandb.init(
         project=wandb_project,
+        name=run_name,
         config=dict(
             EPOCHS=epochs, GRAD_ACCUM_STEPS=grad_accum_steps, LR=lr,
             VALIDATION_SAMPLES=validation_samples, EVAL_INTERVAL=eval_interval,
+            EARLY_STOPPING_PATIENCE=early_stopping_patience,
             OVERFIT_BATCH_SIZE=overfit_batch_size,
             LORA_RANK=lora_rank, LORA_ALPHA=lora_alpha, LORA_DROPOUT=lora_dropout,
             TEXT_LORA_TARGETS=text_lora_targets,
@@ -486,6 +500,9 @@ def main(
             DATASET=dataset_name, MAX_SAMPLES=max_samples,
             NUM_TRIPLETS_PER_EPOCH=num_triplets_per_epoch,
             HOLD_OUT_CLASSES=hold_out_classes,
+            RUN_NAME=run_name,
+            ARTIFACT_DIR=artifact_dir,
+            PREDICTIONS_DIR=predictions_dir,
             md_version="2", trainer="visual_prompt_teacher_forced",
         ),
     )
@@ -497,11 +514,12 @@ def main(
     for _, buf in model.named_buffers():
         buf.data = buf.data.to(device)
 
-    # Inject LoRA on the text decoder + on vision.proj_mlp.
+    # Inject LoRA on the text decoder 
     inject_lora_into_model(
         model, rank=lora_rank, alpha=lora_alpha, dropout=lora_dropout,
         target_modules=text_lora_targets,
     )
+    # Inject LoRA on the vision.proj_mlp
     inject_lora_into_proj_mlp(
         model, rank=proj_mlp_lora_rank, alpha=proj_mlp_lora_alpha,
         dropout=proj_mlp_lora_dropout,
@@ -514,7 +532,7 @@ def main(
         if isinstance(module, LoRALinear):
             module.lora_A.requires_grad = True
             module.lora_B.requires_grad = True
-    for p in model.region.parameters():
+    for p in model.region.parameters(): 
         p.requires_grad = True
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -566,6 +584,7 @@ def main(
     initial = validate_visual_prompt(
         model, val_ds, step=0, max_samples=validation_samples,
         max_plot_samples=val_plot_samples,
+        predictions_dir=predictions_dir,
     )
     best_f1 = initial["f1"]
     best_step = 0
@@ -582,6 +601,8 @@ def main(
     i = 0
     accum_loss_sum = 0.0
     accum_loss_n = 0
+    evals_without_improvement = 0
+    should_stop = False
     for epoch in range(epochs):
         for sample in train_ds:
             i += 1
@@ -618,6 +639,7 @@ def main(
                     val = validate_visual_prompt(
                         model, val_ds, step=step, max_samples=validation_samples,
                         max_plot_samples=val_plot_samples,
+                        predictions_dir=predictions_dir,
                     )
                     logging.info(
                         f"step={step}  val f1={val['f1']:.4f}  "
@@ -631,18 +653,53 @@ def main(
                     if val["f1"] > best_f1:
                         best_f1 = val["f1"]
                         best_step = step
+                        evals_without_improvement = 0
                         save_file(
                             get_lora_state_dict(model, include_region=True),
-                            f"model_artifacts/moondream_visual_prompt_lora_step_{step}.safetensors",
+                            os.path.join(
+                                artifact_dir,
+                                f"moondream_visual_prompt_lora_step_{step}.safetensors",
+                            ),
                         )
                         logging.info(
                             f"saved best LoRA+region adapter at step {step} (f1={best_f1:.4f})"
                         )
+                    else:
+                        evals_without_improvement += 1
+                        logging.info(
+                            f"no f1 improvement for "
+                            f"{evals_without_improvement}/{early_stopping_patience} "
+                            f"evals (best f1={best_f1:.4f} @ step {best_step})"
+                        )
+                        if evals_without_improvement >= early_stopping_patience:
+                            logging.info(
+                                f"early stopping at step {step}: "
+                                f"f1 has not improved for "
+                                f"{early_stopping_patience} consecutive evaluations"
+                            )
+                            should_stop = True
+                            break
+
+                    wandb.log(
+                        {"val/evals_without_improvement": evals_without_improvement},
+                        step=step,
+                    )
+
+        if should_stop:
+            break
     pbar.close()
+
+    if should_stop:
+        wandb.run.summary["early_stopped"] = True
+        wandb.run.summary["early_stopped_at_step"] = best_step + (
+            evals_without_improvement * eval_interval
+        )
 
     # Reload best, run on test split.
     if best_step > 0:
-        path = f"model_artifacts/moondream_visual_prompt_lora_step_{best_step}.safetensors"
+        path = os.path.join(
+            artifact_dir, f"moondream_visual_prompt_lora_step_{best_step}.safetensors"
+        )
         model.load_state_dict(load_file(path), strict=False)
         logging.info(f"loaded best adapter from {path}")
 
@@ -650,6 +707,7 @@ def main(
     test = validate_visual_prompt(
         model, test_ds, step=best_step, max_samples=validation_samples,
         max_plot_samples=val_plot_samples,
+        predictions_dir=predictions_dir,
     )
     logging.info(f"test f1 (best step {best_step}): {test['f1']:.4f}")
     wandb.log({f"test/{k}": v for k, v in test.items()}, step=best_step + 1, commit=True)
@@ -658,11 +716,14 @@ def main(
     wandb.run.summary["test/recall"] = test["recall"]
     wandb.run.summary["best_validation_step"] = best_step
 
+    final_path = os.path.join(
+        artifact_dir, "moondream_visual_prompt_lora_finetune.safetensors"
+    )
     save_file(
         get_lora_state_dict(model, include_region=True),
-        "model_artifacts/moondream_visual_prompt_lora_finetune.safetensors",
+        final_path,
     )
-    logging.info("saved final adapter to model_artifacts/moondream_visual_prompt_lora_finetune.safetensors")
+    logging.info(f"saved final adapter to {final_path}")
     wandb.finish()
 
 
