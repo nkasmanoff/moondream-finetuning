@@ -1,0 +1,19 @@
+# Local dev parity with the Modal image (see app.py::image).
+# Use this if you want to run `python -c "from inference import load_model_from_env"`
+# or `gradio` smoke tests outside of Modal.
+torch>=2.7
+torchvision>=0.22
+einops
+transformers==4.51.3
+safetensors
+huggingface_hub
+tokenizers
+Pillow
+accelerate
+numpy
+gradio==5.50.0
+fastapi[standard]
+modal
+# prepare_examples.py only — not needed at serve time.
+fire
+fiftyone
