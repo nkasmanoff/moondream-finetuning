@@ -8,13 +8,11 @@ import logging
 
 import torch
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import wandb
 
-# Import validation utilities
-from moondream2.rl_utils import match_boxes_score
-from moondream2.visualization_utils import plot_prediction
-from moondream2.moondream_functions import detect
+# `matplotlib` and `wandb` are training-only deps used by `validate()`. We
+# import them lazily inside that function so that inference-only consumers
+# (e.g. the HF Spaces deployment, which only pulls in `LoRALinear` and
+# `inject_lora_into_model` from this module) don't need to install them.
 
 # Constants that may be used by multiple trainers
 MAX_PLOT_SAMPLES = 25
@@ -69,6 +67,13 @@ def validate(model, val_ds, step, max_samples=250, max_plot_samples=MAX_PLOT_SAM
     Returns:
         Dictionary with precision, recall, and f1 scores
     """
+    import matplotlib.pyplot as plt
+    import wandb
+
+    from moondream2.rl_utils import match_boxes_score
+    from moondream2.visualization_utils import plot_prediction
+    from moondream2.moondream_functions import detect
+
     model.eval()
     TP = FP = FN = 0
 
@@ -146,7 +151,8 @@ def validate_with_gt(val_ds, max_samples=250):
     Returns:
         Dictionary with precision, recall, and f1 scores
     """
-    # Use the minimum of max_samples and the actual dataset size
+    from moondream2.rl_utils import match_boxes_score
+
     num_samples = min(max_samples, len(val_ds))
 
     TP = FP = FN = 0

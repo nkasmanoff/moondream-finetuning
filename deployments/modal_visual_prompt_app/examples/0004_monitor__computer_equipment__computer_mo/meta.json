@@ -1,0 +1,20 @@
+{
+  "class_name": "monitor_(computer_equipment) computer_monitor",
+  "num_gt_boxes": 2,
+  "boxes_xywh_normalized": [
+    [
+      0.3692600131034851,
+      0.18168674409389496,
+      0.3068400025367737,
+      0.3561747074127197
+    ],
+    [
+      0.09226000308990479,
+      0.2223493903875351,
+      0.2872200012207031,
+      0.5743674635887146
+    ]
+  ],
+  "split": "test",
+  "hold_out_classes": true
+}

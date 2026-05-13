@@ -1,0 +1,13 @@
+{
+  "architectures": [
+    "HfMoondream"
+  ],
+  "auto_map": {
+    "AutoConfig": "hf_moondream.HfConfig",
+    "AutoModelForCausalLM": "hf_moondream.HfMoondream"
+  },
+  "config": {},
+  "model_type": "moondream1",
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.52.4"
+}

@@ -31,7 +31,9 @@ from torch.utils.data import Dataset
 STORAGE_BUCKET = "frame-images"
 SIGNED_URL_TTL = 60 * 60 * 24  # 24 h
 
-SCENE_QUESTION = "Is this an active mario kart race? Response yes no or unsure"
+
+SCENE_QUESTION = "Is this an active mario kart race? Respond yes, no, or unsure."
+
 POSITION_QUESTION = (
     "What position number (1-24) is shown? "
     "Respond with just the number or n/a if nothing is shown."
@@ -47,6 +49,7 @@ Task = Literal["scene", "position", "coins"]
 # ---------------------------------------------------------------------------
 # Supabase helpers
 # ---------------------------------------------------------------------------
+
 
 def _connect(
     url: str | None = None,
@@ -72,7 +75,9 @@ def _fetch_all_sessions(client: Client, user_id: str) -> list[dict]:
     """Return all analysis_sessions rows for user, newest first."""
     return (
         client.table("analysis_sessions")
-        .select("id, video_name, sample_interval, frame_annotations, race_data, created_at")
+        .select(
+            "id, video_name, sample_interval, frame_annotations, race_data, created_at"
+        )
         .eq("user_id", user_id)
         .order("created_at", desc=True)
         .execute()
@@ -85,18 +90,50 @@ def _sign_urls(
     session_id: str,
     n_frames: int,
     kind: Literal["thumb", "hires"] = "hires",
+    batch_size: int = 200,
 ) -> list[str]:
-    """Return signed download URLs for all frames in a session."""
+    """Return signed download URLs for all frames in a session.
+
+    Batches requests and uses raw HTTP to handle null signedURLs
+    (returned for frames that don't exist in storage) without
+    tripping Pydantic validation in newer storage3 versions.
+    """
     paths = [f"{user_id}/{session_id}/{i}_{kind}.jpg" for i in range(n_frames)]
     if not paths:
         return []
-    result = client.storage.from_(STORAGE_BUCKET).create_signed_urls(paths, SIGNED_URL_TTL)
-    return [item.get("signedURL", "") or "" for item in result]
+
+    session = client.auth.get_session()
+    headers = {
+        "Authorization": f"Bearer {session.access_token}",
+        "apikey": client.supabase_key,
+    }
+    storage_base = f"{client.supabase_url}/storage/v1"
+    sign_url = f"{storage_base}/object/sign/{STORAGE_BUCKET}"
+
+    all_urls: list[str] = []
+    for start in range(0, len(paths), batch_size):
+        batch = paths[start : start + batch_size]
+        resp = requests.post(
+            sign_url,
+            headers=headers,
+            json={"expiresIn": SIGNED_URL_TTL, "paths": batch},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        for item in resp.json():
+            relative = item.get("signedURL")
+            if relative:
+                all_urls.append(f"{storage_base}{relative}")
+            else:
+                all_urls.append("")
+
+    return all_urls
 
 
 # ---------------------------------------------------------------------------
 # Image download / caching
 # ---------------------------------------------------------------------------
+
 
 def _url_cache_key(url: str) -> str:
     """Stable filename derived from the path portion of a signed URL."""
@@ -105,7 +142,11 @@ def _url_cache_key(url: str) -> str:
     return f"{h}_{path}"
 
 
-def _download_image(url: str, cache_dir: Path | None = None) -> Image.Image | None:
+def _download_image(
+    url: str,
+    cache_dir: Path | None = None,
+    http_session: requests.Session | None = None,
+) -> Image.Image | None:
     if not url:
         return None
     if cache_dir:
@@ -113,7 +154,8 @@ def _download_image(url: str, cache_dir: Path | None = None) -> Image.Image | No
         if cached.exists():
             return Image.open(cached).convert("RGB")
     try:
-        resp = requests.get(url, timeout=30)
+        getter = http_session or requests
+        resp = getter.get(url, timeout=30)
         resp.raise_for_status()
         img = Image.open(BytesIO(resp.content)).convert("RGB")
         if cache_dir:
@@ -127,15 +169,31 @@ def _download_image(url: str, cache_dir: Path | None = None) -> Image.Image | No
 def _download_batch(
     urls: list[str],
     cache_dir: Path | None = None,
-    max_workers: int = 16,
+    max_workers: int = 4,
 ) -> list[Image.Image | None]:
+    """Download images with connection pooling and controlled parallelism."""
+    http_session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=max_workers,
+        pool_maxsize=max_workers,
+        max_retries=3,
+    )
+    http_session.mount("https://", adapter)
+    http_session.mount("http://", adapter)
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(lambda u: _download_image(u, cache_dir), urls))
+        results = list(
+            pool.map(lambda u: _download_image(u, cache_dir, http_session), urls)
+        )
+
+    http_session.close()
+    return results
 
 
 # ---------------------------------------------------------------------------
 # Crop helpers (mirror the JS crops in analyzer-engine.ts)
 # ---------------------------------------------------------------------------
+
 
 def crop_bottom_right(img: Image.Image, frac: float = 0.3) -> Image.Image:
     """Bottom-right 30 % crop (used for position reading)."""
@@ -154,6 +212,7 @@ def crop_bottom_left(img: Image.Image, frac: float = 0.3) -> Image.Image:
 # ---------------------------------------------------------------------------
 # Sample type
 # ---------------------------------------------------------------------------
+
 
 class FrameSample:
     __slots__ = ("image", "question", "answer", "session_id", "timestamp", "task")
@@ -178,6 +237,7 @@ class FrameSample:
 # ---------------------------------------------------------------------------
 # PyTorch Dataset
 # ---------------------------------------------------------------------------
+
 
 class KartSceneDataset(Dataset):
     """
@@ -282,10 +342,20 @@ class KartSceneDataset(Dataset):
                 continue
 
             if verbose:
-                print(f"  {sess['video_name']}: {n} frames — downloading {image_kind} images…")
+                print(
+                    f"  {sess['video_name']}: {n} frames — downloading {image_kind} images…"
+                )
 
             urls = _sign_urls(client, user_id, sid, n, kind=image_kind)
             imgs = _download_batch(urls, cache_dir=cache_path)
+
+            n_downloaded = sum(1 for img in imgs if img is not None)
+            if verbose:
+                print(f"    → {n_downloaded}/{n} images downloaded")
+                label_keys = set()
+                for m in frames_meta[:10]:
+                    label_keys.update(m.keys())
+                print(f"    → frame keys (first 10): {sorted(label_keys)}")
 
             for i, (meta, img) in enumerate(zip(frames_meta, imgs)):
                 if img is None:
@@ -311,7 +381,9 @@ class KartSceneDataset(Dataset):
                         else:
                             ans = "n/a"
                         samples.append(
-                            FrameSample(cropped, POSITION_QUESTION, ans, sid, ts, "position")
+                            FrameSample(
+                                cropped, POSITION_QUESTION, ans, sid, ts, "position"
+                            )
                         )
 
                 if "coins" in tasks and scene_label == "in_race":
