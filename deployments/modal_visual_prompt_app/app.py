@@ -40,6 +40,12 @@ from pathlib import Path
 
 import modal
 
+# Source of truth for the Gradio UI lives in `gradio_app.py` so the same
+# Blocks can be served locally (`local_app.py`) or wrapped under ASGI here.
+# We don't import it at module top because the import only needs to succeed
+# *inside* the Modal container — running `modal deploy app.py` from a dev
+# box without `gradio` installed shouldn't be an error.
+
 
 # ============================================================================
 # Modal app + image
@@ -47,33 +53,60 @@ import modal
 
 app = modal.App("moondream-visual-prompt-demo")
 
-BASE_MODEL_PATH = "/root/app/moondream2/model.safetensors"
+# We cache the converted base weights in a Modal Volume rather than baking
+# them into the image. The build-time alternative (`.run_function(...)` in
+# the image) wedged a free CPU sandbox slot for tens of minutes on multiple
+# attempts; doing the download once inside a GPU container (with fast
+# network) and persisting the result to a Volume bypasses that queue
+# entirely. The first cold start pays ~2–3 min for the HF snapshot; every
+# subsequent container starts from the already-converted safetensors.
+BASE_WEIGHTS_VOLUME = modal.Volume.from_name(
+    "moondream-base-weights", create_if_missing=True
+)
+BASE_WEIGHTS_DIR = "/cache/moondream2"
+BASE_MODEL_PATH = f"{BASE_WEIGHTS_DIR}/model.safetensors"
+
 LORA_WEIGHTS_PATH = "/root/app/lora_weights/lora.safetensors"
 EXAMPLES_DIR = "/root/app/examples"
 
-# These must match the LoRA shapes the adapter was *trained* with. Defaults
-# below match scripts/run_visual_prompt_sweep.sh::wide_proj_mlp.
-TEXT_LORA_RANK = 32
-TEXT_LORA_ALPHA = 64
-PROJ_MLP_LORA_RANK = 64
-PROJ_MLP_LORA_ALPHA = 128
+# These must match the LoRA shapes the adapter was *trained* with. The
+# defaults below match the only checkpoint currently in model_artifacts/
+# (moondream_visual_prompt_lora_step_340.safetensors), which was saved with
+# the same hparams as scripts/run_visual_prompt_sweep.sh::wide_both.
+#
+# IMPORTANT: bumping these without re-pointing lora_weights/lora.safetensors
+# at a matching checkpoint will silently produce garbage detections, because
+# `load_state_dict(..., strict=False)` drops every rank-mismatched LoRA
+# tensor without complaining. `inference.py` cross-checks shapes at load
+# time so a real mismatch raises instead of serving an untrained model.
+TEXT_LORA_RANK = 64
+TEXT_LORA_ALPHA = 128
+PROJ_MLP_LORA_RANK = 32
+PROJ_MLP_LORA_ALPHA = 64
 
 
-def _download_and_convert_base_model():
-    """Image build step: pull moondream2 from HF and re-save it in the key
-    layout ``MoondreamModel`` expects (no ``model.`` prefix).
+def _ensure_base_model_on_volume():
+    """Idempotent: pull moondream2 from HF and re-save it in the key layout
+    ``MoondreamModel`` expects (no ``model.`` prefix), onto the mounted Volume.
 
-    Same approach as ``deployments/modal_app/app.py`` but writes to a path
-    inside ``/root/app/moondream2/`` so the trainer-style relative paths
-    (``moondream2/model.safetensors``) keep working at run time.
+    Called from ``@modal.enter()`` rather than at build time — the build-time
+    variant repeatedly stalled in Modal's CPU-build queue. Running this in a
+    GPU container with the Volume mounted gives us fast network *and* a
+    persistent cache, so we pay the ~2–3 min conversion exactly once across
+    every cold start of every container.
     """
     import glob
     import os
     import sys
 
+    if os.path.exists(BASE_MODEL_PATH):
+        print(f"Base model already on volume at {BASE_MODEL_PATH}, skipping download.")
+        return
+
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file, save_file
 
+    print("Base model not on volume — downloading from HF…")
     local_dir = snapshot_download(
         repo_id="vikhyatk/moondream2",
         revision="2025-06-21",
@@ -131,13 +164,19 @@ image = (
         "/root/app/inference.py",
         copy=True,
     )
+    .add_local_file(
+        "gradio_app.py",
+        "/root/app/gradio_app.py",
+        copy=True,
+    )
     .add_local_dir(
         "moondream2",
         "/root/app/moondream2",
         copy=True,
-        # Skip the local 4 GB base weights — `_download_and_convert_base_model`
-        # below pulls them from HF inside the image build, so uploading them
-        # from the dev box just doubles the first-deploy time for nothing.
+        # Skip the local 4 GB base weights — `_ensure_base_model_on_volume`
+        # pulls them from HF at container start and persists them on the
+        # mounted Modal Volume, so uploading them from the dev box would
+        # just bloat every image rebuild for nothing.
         ignore=["model.safetensors", "__pycache__", "*.pyc", "wandb"],
     )
     .add_local_file(
@@ -162,10 +201,6 @@ image = (
             "PROJ_MLP_LORA_ALPHA": str(PROJ_MLP_LORA_ALPHA),
         }
     )
-    # Build step is pure CPU work (HF snapshot download + safetensors key
-    # rename + save). Asking for a GPU here just means we wait in the A10G
-    # queue while doing nothing GPU-y; build this layer on CPU instead.
-    .run_function(_download_and_convert_base_model, cpu=4.0, memory=16384)
 )
 
 
@@ -180,6 +215,8 @@ image = (
     scaledown_window=180,
     max_containers=2,
     retries=1,
+    volumes={BASE_WEIGHTS_DIR: BASE_WEIGHTS_VOLUME},
+    timeout=900,
 )
 @modal.concurrent(max_inputs=8)
 class VisualPromptDemo:
@@ -193,6 +230,12 @@ class VisualPromptDemo:
 
     @modal.enter()
     def setup(self):
+        # First container to ever start fills the Volume; later containers
+        # skip straight to load. Either way `inference.load_model_from_env`
+        # then reads from BASE_MODEL_PATH on the mounted Volume.
+        _ensure_base_model_on_volume()
+        BASE_WEIGHTS_VOLUME.commit()
+
         from inference import detect_with_visual_prompt, load_model_from_env
 
         self.model = load_model_from_env()
@@ -223,9 +266,11 @@ class VisualPromptDemo:
         from fastapi import FastAPI
         from gradio.routes import mount_gradio_app
 
+        from gradio_app import build_gradio_app
+
         # Building the Blocks here (rather than at module top level) lets the
         # closures capture ``self.model`` so we never reload weights per request.
-        blocks = _build_gradio_app(
+        blocks = build_gradio_app(
             model=self.model,
             detect_fn=self._detect,
             examples_dir=EXAMPLES_DIR,
@@ -233,257 +278,6 @@ class VisualPromptDemo:
 
         web_app = FastAPI(title="Moondream Visual-Prompt Demo")
         return mount_gradio_app(app=web_app, blocks=blocks, path="/")
-
-
-# ============================================================================
-# Gradio Blocks
-# ============================================================================
-
-
-def _build_gradio_app(model, detect_fn, examples_dir: str):
-    """Construct the two-tab Gradio Blocks.
-
-    Kept as a free function so it can also be imported by a local entrypoint
-    or unit test without touching Modal.
-    """
-    import gradio as gr
-    import numpy as np
-    from PIL import Image
-
-    HEADER = """
-    # Visual-prompt detection — Moondream 2 fine-tune
-
-    This is *image-as-prompt* detection: instead of asking the model in words
-    ("find all the dogs"), you give it a **picture** of one example, and it
-    finds every other instance of that thing in your target image.
-
-    The fine-tune wires a single mean-pooled vision embedding of the query
-    image into the same prompt slot the tokenizer would normally fill with a
-    class name.
-    """
-
-    # --- helpers -----------------------------------------------------------
-
-    def _bbox_from_painted_layer(layer_rgba: Image.Image) -> tuple[int, int, int, int] | None:
-        """Find the tight bbox of nonzero alpha in a Gradio brush layer.
-
-        Returns ``(x_min, y_min, x_max, y_max)`` in pixel coords or ``None``
-        when the user didn't paint anything.
-        """
-        if layer_rgba.mode != "RGBA":
-            layer_rgba = layer_rgba.convert("RGBA")
-        alpha = np.array(layer_rgba.split()[-1])
-        if alpha.max() == 0:
-            return None
-        ys, xs = np.where(alpha > 0)
-        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
-
-    def _norm_to_pixel_box(box: dict, w: int, h: int) -> tuple[int, int, int, int]:
-        return (
-            max(0, int(round(box["x_min"] * w))),
-            max(0, int(round(box["y_min"] * h))),
-            min(w, int(round(box["x_max"] * w))),
-            min(h, int(round(box["y_max"] * h))),
-        )
-
-    # --- Tab 1: paint-to-find ---------------------------------------------
-
-    def paint_to_find(editor_value, max_objects):
-        if editor_value is None:
-            raise gr.Error("Upload an image first.")
-
-        background = editor_value.get("background")
-        layers = editor_value.get("layers") or []
-        if background is None:
-            raise gr.Error("No image found in the editor.")
-        if not layers:
-            raise gr.Error(
-                "Paint over one example of the object you want to find, "
-                "then click Detect."
-            )
-
-        background = background.convert("RGB")
-        bbox = _bbox_from_painted_layer(layers[0])
-        if bbox is None:
-            raise gr.Error(
-                "I couldn't find any painted pixels — try painting more clearly "
-                "over the example object."
-            )
-
-        query_crop = background.crop(bbox)
-        preds = detect_fn(model, background, query_crop, max_objects=int(max_objects))
-
-        W, H = background.size
-        annotations = [
-            (_norm_to_pixel_box(p, W, H), f"match {i + 1}")
-            for i, p in enumerate(preds)
-        ]
-        status = (
-            f"Found **{len(preds)}** instance(s). "
-            f"Query crop was {bbox[2] - bbox[0]} x {bbox[3] - bbox[1]} px."
-        )
-        return (background, annotations), query_crop, status
-
-    # --- Tab 2: examples gallery ------------------------------------------
-
-    def detect_pair(query_image, target_image, max_objects):
-        if query_image is None or target_image is None:
-            raise gr.Error("Pick a query image and a target image.")
-        target_image = target_image.convert("RGB")
-        query_image = query_image.convert("RGB")
-        preds = detect_fn(model, target_image, query_image, max_objects=int(max_objects))
-        W, H = target_image.size
-        annotations = [
-            (_norm_to_pixel_box(p, W, H), f"match {i + 1}")
-            for i, p in enumerate(preds)
-        ]
-        return (target_image, annotations), f"Found **{len(preds)}** instance(s)."
-
-    examples = _discover_examples(examples_dir)
-
-    # --- assemble ----------------------------------------------------------
-
-    with gr.Blocks(
-        title="Moondream Visual-Prompt Demo",
-        theme=gr.themes.Soft(primary_hue="indigo", secondary_hue="violet"),
-    ) as demo:
-        gr.Markdown(HEADER)
-
-        with gr.Tabs():
-            # ---------- Tab 1 ----------
-            with gr.Tab("Paint to find"):
-                gr.Markdown(
-                    "Upload an image, paint over **one** example object with "
-                    "the brush, then hit **Detect**. The painted region is "
-                    "auto-cropped and used as the visual prompt — the model "
-                    "will draw boxes around every other matching instance "
-                    "in the same image."
-                )
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        editor = gr.ImageEditor(
-                            type="pil",
-                            label="Target image — paint one example object",
-                            sources=["upload", "clipboard"],
-                            brush=gr.Brush(
-                                default_size=28,
-                                colors=["#7c3aed"],
-                                default_color="#7c3aed",
-                                color_mode="fixed",
-                            ),
-                            eraser=gr.Eraser(),
-                            transforms=(),
-                            layers=False,
-                            crop_size=None,
-                            height=520,
-                        )
-                        max_obj_paint = gr.Slider(
-                            1, 50, value=25, step=1,
-                            label="Max objects to detect",
-                        )
-                        detect_btn = gr.Button("Detect", variant="primary", size="lg")
-                    with gr.Column(scale=2):
-                        annotated_paint = gr.AnnotatedImage(
-                            label="Detections",
-                            color_map={f"match {i}": "#7c3aed" for i in range(1, 51)},
-                            height=520,
-                        )
-                        with gr.Row():
-                            query_preview = gr.Image(
-                                type="pil",
-                                label="Auto-extracted query crop",
-                                height=180,
-                                interactive=False,
-                            )
-                            status_paint = gr.Markdown()
-
-                detect_btn.click(
-                    fn=paint_to_find,
-                    inputs=[editor, max_obj_paint],
-                    outputs=[annotated_paint, query_preview, status_paint],
-                    api_name="paint_to_find",
-                )
-
-            # ---------- Tab 2 ----------
-            with gr.Tab("LVIS examples"):
-                gr.Markdown(
-                    "These are (query crop, target image) pairs sampled from "
-                    "the LVIS validation split. Click an example to load it, "
-                    "then hit **Detect** to run the model."
-                )
-                with gr.Row():
-                    with gr.Column(scale=1):
-                        gallery_query = gr.Image(
-                            type="pil",
-                            label="Query crop",
-                            height=240,
-                        )
-                    with gr.Column(scale=2):
-                        gallery_target = gr.Image(
-                            type="pil",
-                            label="Target image",
-                            height=420,
-                        )
-                with gr.Row():
-                    max_obj_pair = gr.Slider(
-                        1, 50, value=25, step=1,
-                        label="Max objects to detect",
-                    )
-                    detect_pair_btn = gr.Button("Detect", variant="primary", size="lg")
-
-                annotated_pair = gr.AnnotatedImage(
-                    label="Detections on target",
-                    color_map={f"match {i}": "#7c3aed" for i in range(1, 51)},
-                    height=520,
-                )
-                status_pair = gr.Markdown()
-
-                if examples:
-                    gr.Examples(
-                        examples=examples,
-                        inputs=[gallery_query, gallery_target],
-                        label="Click an example to load it",
-                        examples_per_page=8,
-                    )
-                else:
-                    gr.Markdown(
-                        "_No examples bundled — run `python prepare_examples.py` "
-                        "before deploying to populate this tab._"
-                    )
-
-                detect_pair_btn.click(
-                    fn=detect_pair,
-                    inputs=[gallery_query, gallery_target, max_obj_pair],
-                    outputs=[annotated_pair, status_pair],
-                    api_name="detect_pair",
-                )
-
-        gr.Markdown(
-            "---\n"
-            "**Tips:** the model was trained on LVIS objects — it generalizes "
-            "best when the query crop is a *clean, well-cropped* example. "
-            "Heavy occlusion or unusual viewpoints in the query lower recall."
-        )
-
-    return demo
-
-
-def _discover_examples(examples_dir: str) -> list[list[str]]:
-    """Find ``examples/<id>/{query.png,target.png}`` pairs.
-
-    Tolerates a missing or empty examples dir (returns ``[]``); ``app.py``
-    still works, the Examples block just won't render.
-    """
-    base = Path(examples_dir)
-    if not base.exists():
-        return []
-    pairs: list[list[str]] = []
-    for sub in sorted(p for p in base.iterdir() if p.is_dir()):
-        q = sub / "query.png"
-        t = sub / "target.png"
-        if q.exists() and t.exists():
-            pairs.append([str(q), str(t)])
-    return pairs
 
 
 # ============================================================================

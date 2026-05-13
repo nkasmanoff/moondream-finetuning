@@ -18,9 +18,11 @@ REST API (Gradio's auto-generated `/api/predict`).
 
 ```
 deployments/modal_visual_prompt_app/
-├── app.py                # Modal entrypoint + Gradio Blocks
+├── app.py                # Modal entrypoint (mounts the Blocks under ASGI)
+├── local_app.py          # Local launcher (`python local_app.py`)
+├── gradio_app.py         # Shared Gradio Blocks (no Modal dep)
 ├── inference.py          # Trim of visual_prompt_trainer for serving
-├── prepare_examples.py   # Local helper to populate examples/ from LVIS
+├── prepare_examples.py   # Helper to populate examples/ from LVIS
 ├── moondream2/           # symlink → ../../moondream2
 ├── trainer_helpers.py    # symlink → ../../trainer_helpers.py
 ├── lora_weights/
@@ -30,13 +32,48 @@ deployments/modal_visual_prompt_app/
 └── README.md
 ```
 
-## Quick start
+## Quick start — run it locally
+
+The Gradio Blocks have zero Modal dependency, so you can run them straight on
+your laptop (CUDA, Apple Silicon MPS, or CPU). This is also what you'd push to
+a Hugging Face Space.
 
 ```bash
 cd deployments/modal_visual_prompt_app
 
-# 1. (Optional but recommended) Populate the LVIS examples gallery.
-#    Requires fiftyone — only needs to be run *once*, locally.
+# 1. (Optional) Populate the LVIS examples gallery (once, local-only).
+python prepare_examples.py --num_pairs=8
+
+# 2. Launch — uses ../../moondream2/model.safetensors and lora_weights/lora.safetensors
+#    by default, picks cuda > mps > cpu, serves on http://127.0.0.1:7860/.
+python local_app.py
+
+# Useful flags:
+python local_app.py --device cpu                      # force CPU
+python local_app.py --port 7861                       # change port
+python local_app.py --share                           # public Gradio tunnel
+python local_app.py --base-model /abs/path/to/m.safetensors \
+                    --lora       /abs/path/to/lora.safetensors
+```
+
+`local_app.py` defaults to the LoRA hparams of the checkpoint shipped in
+`model_artifacts/` (`text_lora_rank=64 / alpha=128`,
+`proj_mlp_lora_rank=32 / alpha=64`). If you point `--lora` at a different
+sweep checkpoint, pass the matching `--text-lora-rank` etc. — `inference.py`
+cross-checks shapes and will refuse to silently load a mismatched adapter.
+
+### Gradio version note
+
+Both Gradio 5.x and 6.x work. The Modal image pins `gradio==5.50.0`; on a
+local 6.x install you'll see a one-off warning about `theme=` having moved
+from `gr.Blocks(...)` to `demo.launch(...)` — harmless.
+
+## Quick start — deploy on Modal
+
+```bash
+cd deployments/modal_visual_prompt_app
+
+# 1. (Optional) Populate the LVIS examples gallery.
 python prepare_examples.py --num_pairs=8
 
 # 2. Live-reload dev (creates an https tunnel; reloads on file save).

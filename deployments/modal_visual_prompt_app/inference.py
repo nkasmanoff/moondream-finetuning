@@ -39,6 +39,26 @@ from trainer_helpers import LoRALinear, inject_lora_into_model
 
 
 # ============================================================================
+# Device selection
+# ============================================================================
+
+
+def _pick_device() -> str:
+    """CUDA → MPS → CPU. Honors ``MOONDREAM_DEVICE`` for explicit overrides
+    (useful when MPS works for the ViT but you want to force CPU for the
+    text decoder while debugging, or vice versa).
+    """
+    forced = os.environ.get("MOONDREAM_DEVICE")
+    if forced:
+        return forced
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+# ============================================================================
 # LoRA on vision.proj_mlp (mirrors visual_prompt_trainer.inject_lora_into_proj_mlp)
 # ============================================================================
 
@@ -168,7 +188,7 @@ def load_model(
         text_lora_targets = ["qkv", "proj", "fc1", "fc2"]
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = _pick_device()
 
     model = MoondreamModel(config=MoondreamConfig(), setup_caches=True)
     model.load_state_dict(load_file(base_model_path))
@@ -193,7 +213,45 @@ def load_model(
     # The trainer saves LoRA-only A/B + the full region head into one file, so
     # strict=False is intentional — the base model keys aren't in this file.
     adapter_state = load_file(lora_weights_path)
-    model.load_state_dict(adapter_state, strict=False)
+
+    # Cross-check LoRA ranks before loading. `load_state_dict(strict=False)`
+    # silently drops any tensor whose shape doesn't match the model's, so a
+    # rank mismatch between the constants at the top of `app.py` and the
+    # actual checkpoint would otherwise serve an *untrained* LoRA adapter —
+    # a "working" URL returning garbage detections. Fail loudly instead.
+    model_state = model.state_dict()
+    shape_mismatches: list[str] = []
+    for k, v in adapter_state.items():
+        if k in model_state and tuple(model_state[k].shape) != tuple(v.shape):
+            shape_mismatches.append(
+                f"  {k}: model={tuple(model_state[k].shape)} "
+                f"vs checkpoint={tuple(v.shape)}"
+            )
+    if shape_mismatches:
+        raise RuntimeError(
+            "LoRA shape mismatch between the model built from the configured "
+            "ranks and the checkpoint being loaded — `strict=False` would "
+            "silently drop these and produce a model with untrained "
+            "adapters. Fix the *_LORA_RANK / *_LORA_ALPHA constants in "
+            "app.py (or repoint lora_weights/lora.safetensors at a matching "
+            "checkpoint). Mismatches:\n" + "\n".join(shape_mismatches)
+        )
+
+    missing, unexpected = model.load_state_dict(adapter_state, strict=False)
+    # Adapter checkpoints don't include base-model weights, so `missing` is
+    # expected. `unexpected` should be empty after the shape check above; if
+    # it isn't, the checkpoint has keys the current model doesn't define,
+    # which is also worth flagging rather than silently ignoring.
+    if unexpected:
+        raise RuntimeError(
+            f"Unexpected keys in LoRA checkpoint not present in model: "
+            f"{unexpected[:5]}{'…' if len(unexpected) > 5 else ''}"
+        )
+    print(
+        f"Loaded LoRA adapters — {len(adapter_state)} tensor(s) applied, "
+        f"{len(missing)} base-model key(s) untouched (expected)."
+    )
+
     model.eval()
     return model
 
@@ -223,4 +281,5 @@ def load_model_from_env() -> MoondreamModel:
         text_lora_alpha=float(os.environ.get("TEXT_LORA_ALPHA", "64")),
         proj_mlp_lora_rank=int(os.environ.get("PROJ_MLP_LORA_RANK", "64")),
         proj_mlp_lora_alpha=float(os.environ.get("PROJ_MLP_LORA_ALPHA", "128")),
+        device=os.environ.get("MOONDREAM_DEVICE"),
     )

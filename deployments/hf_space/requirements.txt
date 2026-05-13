@@ -1,11 +1,21 @@
+# HF Spaces (ZeroGPU) runtime requirements.
+# Notes:
+#   - `spaces` is the ZeroGPU runtime library (provides `@spaces.GPU`).
+#   - PyTorch is pinned to 2.8.0 (+ matching torchvision 0.23.0).
+#     ZeroGPU's supported PyTorch range now starts at 2.8.0 (it dropped
+#     2.1–2.7 when the backing hardware moved to RTX Pro 6000 Blackwell);
+#     anything below this floor fails to build on the Space.
+#   - transformers/tokenizers/safetensors versions match what
+#     `moondream2/` and `inference.py` were tested against.
+spaces
+torch==2.8.0
+torchvision==0.23.0
 einops
-transformers>=4.51
-torch>=2.7
-torchvision>=0.22
+transformers==4.51.3
 safetensors
 huggingface_hub
-gradio>=4.0
-spaces
 tokenizers
 Pillow
-requests
+accelerate
+numpy
+gradio==5.50.0

@@ -1,66 +1,67 @@
 ---
-title: Mario Kart Race Detector
-emoji: 🏎️
-colorFrom: red
-colorTo: blue
+title: Moondream Visual-Prompt Demo
+emoji: 🎯
+colorFrom: indigo
+colorTo: purple
 sdk: gradio
-sdk_version: "5.0"
+sdk_version: 5.50.0
+python_version: "3.10"
 app_file: app.py
-pinned: false
 hardware: zero-a10g
+pinned: false
+license: apache-2.0
+short_description: Image-as-prompt object detection (Moondream 2 LoRA)
 ---
 
-# Mario Kart Race Detector API
+# Moondream Visual-Prompt Demo
 
-Fine-tuned Moondream model that detects whether a screenshot shows an active Mario Kart race.
+Image-as-prompt object detection: instead of asking the model in *words*
+("find all the dogs"), give it a **picture** of one example object — the
+fine-tuned Moondream 2 will draw boxes around every other matching
+instance in your target image.
 
-## API Usage
+## How it works
 
-### Python (gradio_client)
+The base [Moondream 2](https://huggingface.co/vikhyatk/moondream2) detect
+template is
 
-```python
-from gradio_client import Client
+    [BOS, image patches] [detect prefix] [tokenize(" cat")] [detect suffix]
 
-client = Client("YOUR_SPACE_URL")
-result = client.predict(
-    "path/to/screenshot.jpg",   # image filepath or URL
-    "Is this an active mario kart race? Respond yes, no, or unsure.",
-    api_name="/predict",
-)
-print(result)  # {"answer": "yes", "is_race": True}
-```
+The fine-tune in this Space replaces the tokenized class name with a
+mean-pooled vision embedding of a query image:
 
-### Python (requests)
+    [BOS, image patches] [detect prefix] [* mean_pool(vis_enc(query)) *] [detect suffix]
+                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                          a single splice slot, fed by the
+                                          LoRA-trained vision.proj_mlp
 
-```python
-import base64, requests
+The model learns to detect "things that look like *this* image" instead of
+"things that match *this word*".
 
-with open("screenshot.jpg", "rb") as f:
-    b64 = base64.b64encode(f.read()).decode()
+Trainable parameters were:
 
-resp = requests.post(
-    "YOUR_SPACE_URL/api/predict",
-    json={"data": [f"data:image/jpeg;base64,{b64}", "Is this an active mario kart race? Respond yes, no, or unsure."]},
-)
-print(resp.json())
-```
+- LoRA on the text decoder (`qkv`, `proj`, `fc1`, `fc2`) — rank 64
+- LoRA on `vision.proj_mlp.{fc1,fc2}` — rank 32
+- Full fine-tune of the region head
 
-### curl
+Trained on LVIS triplets (query crop from one image, target image with one
+or more instances of the same class). Source code:
+[github.com/nkasmanoff/moondream-finetuning](https://github.com/nkasmanoff/moondream-finetuning)
+(if public).
 
-```bash
-curl -X POST YOUR_SPACE_URL/api/predict \
-  -H "Content-Type: application/json" \
-  -d '{"data": ["data:image/jpeg;base64,<BASE64>", "Is this an active mario kart race? Respond yes, no, or unsure."]}'
-```
+## Two ways to try it
 
-## Setup
+- **Paint to find** — upload an image, paint over one example object with
+  the brush. The painted region is auto-cropped and used as the visual
+  prompt; the model draws boxes around every other matching instance in
+  the same image.
+- **LVIS examples** — clickable gallery of (query, target) pairs sampled
+  from the LVIS validation split.
 
-1. Create a new HF Space (Gradio SDK, ZeroGPU hardware).
-2. Push this entire folder as the Space repo.
-3. Copy your LoRA weights to `lora_weights/lora.safetensors`.
-4. Set environment variables in the Space settings if the defaults don't match:
-   - `BASE_MODEL_REPO` – HF repo for the base model (default: `moondream/starmie-v1`)
-   - `BASE_MODEL_FILE` – filename within the repo (default: `model.safetensors`)
-   - `LORA_WEIGHTS_PATH` – path to LoRA weights in the Space (default: `lora_weights/lora.safetensors`)
-   - `LORA_RANK` – LoRA rank (default: `32`)
-   - `LORA_ALPHA` – LoRA alpha (default: `64`)
+## Hardware
+
+This Space runs on **ZeroGPU** (NVIDIA H200, dynamically allocated). A
+typical detection takes <2 s of GPU time. Cold starts pay ~30 s for the
+first download of the base Moondream weights from
+[`vikhyatk/moondream2`](https://huggingface.co/vikhyatk/moondream2);
+subsequent restarts hit the HF cache and start in seconds.
